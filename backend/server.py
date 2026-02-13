@@ -703,6 +703,20 @@ async def update_component(component_id: str, update: ComponentUpdate, request: 
     return {"message": "Component updated", "component_id": component_id}
 
 # ============== Pig Pen Operators Routes ==============
+# CANONICAL PROTECTION: Operators with is_canonical=True can ONLY be modified by sovereign (TSID-0001)
+# Users can ADD new operators, but cannot edit/delete canonical ones
+
+SOVEREIGN_EMAIL = "jonpearlandpig@gmail.com"  # Founder email for sovereign access
+
+async def check_canonical_access(user: User, operator: dict, action: str):
+    """Check if user can modify a canonical operator"""
+    if operator.get("is_canonical", False):
+        # Only sovereign can modify canonical operators
+        if user.email != SOVEREIGN_EMAIL:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"CANONICAL PROTECTION: Cannot {action} canonical operator '{operator.get('name')}'. Only sovereign authority (TSID-0001) can modify canonical operators."
+            )
 
 @api_router.get("/pigpen")
 async def get_pigpen_operators(category: Optional[str] = None):
@@ -710,8 +724,18 @@ async def get_pigpen_operators(category: Optional[str] = None):
     if category and category != "all":
         query["category"] = category
     
-    operators = await db.pigpen_operators.find(query, {"_id": 0}).to_list(100)
-    return {"operators": operators, "total": len(operators)}
+    operators = await db.pigpen_operators.find(query, {"_id": 0}).sort([("decision_weight", -1), ("tai_d", 1)]).to_list(200)
+    
+    # Count canonical vs user-added
+    canonical_count = sum(1 for o in operators if o.get("is_canonical", False))
+    user_count = len(operators) - canonical_count
+    
+    return {
+        "operators": operators, 
+        "total": len(operators),
+        "canonical_count": canonical_count,
+        "user_count": user_count
+    }
 
 @api_router.get("/pigpen/{operator_id}")
 async def get_pigpen_operator(operator_id: str):
@@ -724,16 +748,23 @@ async def get_pigpen_operator(operator_id: str):
 async def create_pigpen_operator(operator: PigPenOperatorCreate, request: Request):
     user = await require_editor(request)
     
+    # Check if TAI-D already exists
+    existing = await db.pigpen_operators.find_one({"tai_d": operator.tai_d})
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Operator with TAI-D '{operator.tai_d}' already exists")
+    
     new_operator = PigPenOperator(**operator.model_dump())
     op_dict = new_operator.model_dump()
+    op_dict["is_canonical"] = False  # User-created operators are NEVER canonical
+    op_dict["decision_weight"] = op_dict.get("decision_weight", 1)  # Default low weight
     op_dict["created_at"] = op_dict["created_at"].isoformat()
     op_dict["updated_at"] = op_dict["updated_at"].isoformat()
     
     await db.pigpen_operators.insert_one(op_dict)
     await save_version(user, "pigpen", new_operator.operator_id, op_dict, "create", f"Created operator: {operator.name}")
-    await log_audit(user, "create", "pigpen", new_operator.operator_id, operator.name)
+    await log_audit(user, "create", "pigpen", new_operator.operator_id, operator.name, {"is_canonical": False})
     
-    return {"message": "Operator created", "operator_id": new_operator.operator_id}
+    return {"message": "Operator created", "operator_id": new_operator.operator_id, "is_canonical": False}
 
 @api_router.put("/pigpen/{operator_id}")
 async def update_pigpen_operator(operator_id: str, update: PigPenOperatorUpdate, request: Request):
@@ -742,6 +773,9 @@ async def update_pigpen_operator(operator_id: str, update: PigPenOperatorUpdate,
     operator = await db.pigpen_operators.find_one({"operator_id": operator_id}, {"_id": 0})
     if not operator:
         raise HTTPException(status_code=404, detail="Operator not found")
+    
+    # CANONICAL PROTECTION CHECK
+    await check_canonical_access(user, operator, "edit")
     
     await save_version(user, "pigpen", operator_id, operator, "update", f"Before update: {operator.get('name')}")
     
